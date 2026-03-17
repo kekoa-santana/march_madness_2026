@@ -280,8 +280,8 @@ def compute_massey_features(ordinals_df, systems=None) -> pd.DataFrame:
     '''
     Compute aggregated ranking features from Massey Ordinals (Men only)
 
-    Filters to end-of-regular season rankings (RankingDayNum = 133) and computes
-    summary stats across all rankings systems, plus individual ranks for key systems.
+    Uses end-of-regular season rankings (RankingDayNum = 133) when available,
+    otherwise falls back to the latest available RankingDayNum per season.
 
     Args:
         ordinals_df: DataFrame from MMasseyOrdinals.csv
@@ -293,8 +293,12 @@ def compute_massey_features(ordinals_df, systems=None) -> pd.DataFrame:
     if systems is None:
         systems = {'POM', 'SAG', 'RPI'}
 
-    # Filter to end-of-season rankings only
-    eos = ordinals_df[ordinals_df['RankingDayNum'] == 133].copy()
+    # Use DayNum 133 where available; for seasons without it, use max available
+    max_day_per_season = ordinals_df.groupby('Season')['RankingDayNum'].max().reset_index()
+    max_day_per_season.columns = ['Season', 'MaxDay']
+    max_day_per_season['UseDay'] = max_day_per_season['MaxDay'].clip(upper=133)
+    merged = ordinals_df.merge(max_day_per_season[['Season', 'UseDay']], on='Season', how='left')
+    eos = merged[merged['RankingDayNum'] == merged['UseDay']].drop(columns=['UseDay']).copy()
 
     # Aggregate stats across systems
     agg = eos.groupby(['Season', 'TeamID'])['OrdinalRank'].agg(
@@ -336,8 +340,82 @@ def compute_conference_strength(conf_df, elo_df) -> pd.DataFrame:
     return result[['Season', 'TeamID', 'ConfAbbrev', 'Conf_Elo_mean']]
 
 
+def compute_advanced_stats(detail_df) -> pd.DataFrame:
+    '''
+    Compute additional per-team per-season stats not in compute_season_stats.
+
+    New features:
+    - FG3_pct: 3-point field goal percentage (FGM3 / FGA3)
+    - FG3_rate: 3-point attempt rate (FGA3 / FGA)
+    - Ast_TO_ratio: assist-to-turnover ratio
+    - Stl_rate: steals per possession
+    - Blk_rate: blocks per opponent FGA
+    - Reb_margin: total rebounds - opponent total rebounds per game
+    - Scoring_margin: PPG - PPG_allowed (point differential)
+
+    Args:
+        detail_df: DataFrame from M/WRegularSeasonDetailedResults.csv
+
+    Returns:
+        DataFrame with [Season, TeamID, FG3_pct, FG3_rate, Ast_TO_ratio,
+                        Stl_rate, Blk_rate, Reb_margin, Scoring_margin]
+    '''
+    reg = detail_df[detail_df['DayNum'] <= 132].copy()
+
+    w_rows = pd.DataFrame({
+        'Season': reg['Season'],
+        'TeamID': reg['WTeamID'],
+        'FGM3': reg['WFGM3'], 'FGA3': reg['WFGA3'],
+        'FGA': reg['WFGA'],
+        'Ast': reg['WAst'], 'TO': reg['WTO'],
+        'Stl': reg['WStl'], 'Blk': reg['WBlk'],
+        'OR': reg['WOR'], 'DR': reg['WDR'],
+        'Opp_OR': reg['LOR'], 'Opp_DR': reg['LDR'],
+        'Opp_FGA': reg['LFGA'], 'Opp_FTA': reg['LFTA'], 'Opp_TO': reg['LTO'],
+        'FTA': reg['WFTA'],
+        'Points': reg['WScore'], 'OppPoints': reg['LScore'],
+    })
+    l_rows = pd.DataFrame({
+        'Season': reg['Season'],
+        'TeamID': reg['LTeamID'],
+        'FGM3': reg['LFGM3'], 'FGA3': reg['LFGA3'],
+        'FGA': reg['LFGA'],
+        'Ast': reg['LAst'], 'TO': reg['LTO'],
+        'Stl': reg['LStl'], 'Blk': reg['LBlk'],
+        'OR': reg['LOR'], 'DR': reg['LDR'],
+        'Opp_OR': reg['WOR'], 'Opp_DR': reg['WDR'],
+        'Opp_FGA': reg['WFGA'], 'Opp_FTA': reg['WFTA'], 'Opp_TO': reg['WTO'],
+        'FTA': reg['LFTA'],
+        'Points': reg['LScore'], 'OppPoints': reg['WScore'],
+    })
+
+    games = pd.concat([w_rows, l_rows], ignore_index=True)
+
+    # Per-game metrics
+    games['FG3_pct'] = games['FGM3'] / games['FGA3'].replace(0, float('nan'))
+    games['FG3_rate'] = games['FGA3'] / games['FGA']
+    games['Ast_TO_ratio'] = games['Ast'] / games['TO'].replace(0, float('nan'))
+    poss = games['FGA'] - games['OR'] + games['TO'] + 0.44 * games['FTA']
+    games['Stl_rate'] = games['Stl'] / poss.replace(0, float('nan'))
+    games['Blk_rate'] = games['Blk'] / games['Opp_FGA'].replace(0, float('nan'))
+    games['Reb_margin'] = (games['OR'] + games['DR']) - (games['Opp_OR'] + games['Opp_DR'])
+    games['Scoring_margin'] = games['Points'] - games['OppPoints']
+
+    agg = games.groupby(['Season', 'TeamID']).agg(
+        FG3_pct=('FG3_pct', 'mean'),
+        FG3_rate=('FG3_rate', 'mean'),
+        Ast_TO_ratio=('Ast_TO_ratio', 'mean'),
+        Stl_rate=('Stl_rate', 'mean'),
+        Blk_rate=('Blk_rate', 'mean'),
+        Reb_margin=('Reb_margin', 'mean'),
+        Scoring_margin=('Scoring_margin', 'mean'),
+    ).reset_index()
+
+    return agg
+
+
 def build_team_features(elo_df, seeds_df=None, stats_df=None, massey_df=None,
-                        conf_df=None, efficiency_df=None) -> pd.DataFrame:
+                        conf_df=None, efficiency_df=None, advanced_df=None) -> pd.DataFrame:
     '''
     Merge all per-team per-season features into a single DataFrame.
 
@@ -369,6 +447,9 @@ def build_team_features(elo_df, seeds_df=None, stats_df=None, massey_df=None,
 
     if efficiency_df is not None:
         features = features.merge(efficiency_df, on=['Season', 'TeamID'], how='left')
+
+    if advanced_df is not None:
+        features = features.merge(advanced_df, on=['Season', 'TeamID'], how='left')
 
     return features
 

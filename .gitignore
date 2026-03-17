@@ -2,3 +2,14 @@ myenv/*
 data/*
 docs/*
 submissions/
+
+predictions/
+possible_improvements.md
+.claude/
+CLAUDE.md
+.pytest_cache/
+catboost_info/
+__pycache__/
+*.pyc
+.env
+.*log
